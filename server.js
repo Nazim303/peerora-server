@@ -125,7 +125,7 @@ io.on('connection', (socket) => {
     if (callback) callback(publicList);
   });
 
-  // 1. ODA OLUŞTURMA (Güvenlik Kontrolleri Dahil)
+// 1. ODA OLUŞTURMA (Düzeltildi: users dizisi callback ile geri dönüyor)
   socket.on('room:create', ({ username, avatar, maxUsers, initialMediaUrl, isPublic, roomTitle, presetTheme }, callback) => {
     const roomId = Math.floor(100000 + Math.random() * 900000).toString();
     const limit = Math.min(Math.max(parseInt(maxUsers) || 10, 2), 10);
@@ -140,13 +140,15 @@ io.on('connection', (socket) => {
       initialType = (cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be')) ? 'YOUTUBE' : 'DIRECT';
     }
 
+    const initialUsers = [{ id: socket.id, username: cleanUsername, avatar: cleanAvatar, isHost: true, isMuted: false }];
+
     rooms.set(roomId, {
       host: socket.id,
       title: cleanTitle,
       isPublic: isPublic ?? true,
       presetTheme: sanitizeText(presetTheme, 30) || 'neo_brutalism',
       maxUsers: limit,
-      users: [{ id: socket.id, username: cleanUsername, avatar: cleanAvatar, isHost: true, isMuted: false }],
+      users: initialUsers,
       mediaState: {
         sourceType: initialType,
         sourceUrl: cleanUrl,
@@ -168,7 +170,8 @@ io.on('connection', (socket) => {
         roomId, 
         isHost: true, 
         maxUsers: limit,
-        mediaState: rooms.get(roomId).mediaState 
+        mediaState: rooms.get(roomId).mediaState,
+        users: initialUsers // <-- ARTIK 1/2 DOĞRU GÖSTERİR
       });
     }
 
