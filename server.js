@@ -7,10 +7,8 @@ import rateLimit from 'express-rate-limit';
 
 const app = express();
 
-// 1. HTTP Güvenlik Başlıkları (Clickjacking & XSS Koruması)
 app.use(helmet({ contentSecurityPolicy: false }));
 
-// 2. İzin Verilen Kaynaklar (CORS)
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:4173',
@@ -18,7 +16,7 @@ const allowedOrigins = [
   'capacitor://localhost',
   'https://www.theosdev.web.tr',
   'https://theosdev.web.tr',
-  'https://peerora.theosdev.web.tr' // İleride alt alan adı açarsanız
+  'https://peerora.theosdev.web.tr'
 ];
 app.use(cors({
   origin: (origin, callback) => {
@@ -31,7 +29,6 @@ app.use(cors({
   credentials: true
 }));
 
-// 3. HTTP DDoS / Flood Koruması
 const limiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 300,
@@ -39,25 +36,24 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
+app.get('/ping', (req, res) => res.status(200).send('pong'));
+
 const server = createServer(app);
 
-// 4. Socket.io Bellek ve Bağlantı Sınırları (DoS Koruması)
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
-  maxHttpBufferSize: 1e5, // Maksimum paket boyutu: 100 KB (Bellek şişirme saldırılarını engeller)
+  maxHttpBufferSize: 1e5,
   pingTimeout: 20000,
   pingInterval: 10000
 });
 
 const rooms = new Map();
 
-// XSS ve Zararlı Karakter Temizleyici
 function sanitizeText(str, maxLength = 250) {
   if (typeof str !== 'string') return '';
   return str.replace(/[<>]/g, '').trim().slice(0, maxLength);
 }
 
-// Açık odaları istemcilere yayınlayan yardımcı fonksiyon
 function broadcastPublicRooms() {
   const publicList = [];
   rooms.forEach((room, id) => {
@@ -88,11 +84,9 @@ function handleLeave(socket) {
       message: 'Oda yöneticisi ayrıldığı için oturum sonlandırıldı.'
     });
     rooms.delete(roomId);
-    console.log(`[Oda Kapatıldı] ID: ${roomId} (Host ayrıldı)`);
   } else {
     room.users = room.users.filter((u) => u.id !== socket.id);
     socket.to(roomId).emit('room:user_left', { userId: socket.id, users: room.users });
-    console.log(`[Misafir Ayrıldı] ID: ${roomId} | Kalan: ${room.users.length}`);
   }
 
   socket.leave(roomId);
@@ -100,12 +94,48 @@ function handleLeave(socket) {
   broadcastPublicRooms();
 }
 
+function resolveSpyfallVotes(room, roomId) {
+  if (!room.game || room.game.phase === 'RESULT') return;
+  room.game.phase = 'RESULT';
+
+  const voteCounts = {};
+  Object.values(room.game.votes || {}).forEach((targetId) => {
+    voteCounts[targetId] = (voteCounts[targetId] || 0) + 1;
+  });
+
+  let maxVotes = 0;
+  let eliminatedId = null;
+  let isTie = false;
+
+  Object.entries(voteCounts).forEach(([userId, count]) => {
+    if (count > maxVotes) {
+      maxVotes = count;
+      eliminatedId = userId;
+      isTie = false;
+    } else if (count === maxVotes) {
+      isTie = true;
+    }
+  });
+
+  const eliminatedUser = room.users.find((u) => u.id === eliminatedId);
+  const isSpyEliminated = !isTie && eliminatedId === room.game.spyId;
+  const winner = isSpyEliminated ? 'INNOCENTS' : 'SPY';
+
+  io.to(roomId).emit('game:spyfall_result', {
+    winner,
+    eliminatedName: isTie ? null : (eliminatedUser ? eliminatedUser.username : null),
+    isTie,
+    maxVotes,
+    spyName: room.game.spyName,
+    location: room.game.location,
+    voteCounts
+  });
+}
+
 io.on('connection', (socket) => {
-  // Soket Spam / Flood Koruması
   let chatRateCounter = 0;
   const rateLimitInterval = setInterval(() => { chatRateCounter = 0; }, 1000);
 
-  // Açık odaların güncel listesini gönder
   socket.on('rooms:get_public', (callback) => {
     const publicList = [];
     rooms.forEach((room, id) => {
@@ -125,7 +155,7 @@ io.on('connection', (socket) => {
     if (callback) callback(publicList);
   });
 
-// 1. ODA OLUŞTURMA (Düzeltildi: users dizisi callback ile geri dönüyor)
+  // 1. ODA OLUŞTURMA
   socket.on('room:create', ({ username, avatar, maxUsers, initialMediaUrl, isPublic, roomTitle, presetTheme }, callback) => {
     const roomId = Math.floor(100000 + Math.random() * 900000).toString();
     const limit = Math.min(Math.max(parseInt(maxUsers) || 10, 2), 10);
@@ -149,6 +179,7 @@ io.on('connection', (socket) => {
       presetTheme: sanitizeText(presetTheme, 30) || 'neo_brutalism',
       maxUsers: limit,
       users: initialUsers,
+      game: null,
       mediaState: {
         sourceType: initialType,
         sourceUrl: cleanUrl,
@@ -171,7 +202,7 @@ io.on('connection', (socket) => {
         isHost: true, 
         maxUsers: limit,
         mediaState: rooms.get(roomId).mediaState,
-        users: initialUsers // <-- ARTIK 1/2 DOĞRU GÖSTERİR
+        users: initialUsers
       });
     }
 
@@ -208,7 +239,8 @@ io.on('connection', (socket) => {
         mediaState: { ...room.mediaState, currentTime: calculatedTime },
         playlist: room.playlist,
         poll: room.poll,
-        users: room.users
+        users: room.users,
+        game: room.game ? { type: room.game.type, isSpectator: true, endTime: room.game.endTime } : null
       });
     }
 
@@ -220,7 +252,7 @@ io.on('connection', (socket) => {
     broadcastPublicRooms();
   });
 
-  // 3. WEBRTC SİNYALLEŞMESİ
+  // 3. WEBRTC
   socket.on('webrtc:signal', ({ targetId, payload }) => {
     if (targetId) {
       io.to(targetId).emit('webrtc:signal', { sender: socket.id, payload });
@@ -229,14 +261,14 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 4. LAZER İMLEÇ
+  // 4. LAZER
   socket.on('laser:point', (point) => {
     if (socket.roomId && point && typeof point.x === 'number' && typeof point.y === 'number') {
       socket.to(socket.roomId).emit('laser:point', { ...point, senderId: socket.id });
     }
   });
 
-  // 5. ANKET SİSTEMİ
+  // 5. ANKET
   socket.on('poll:create', (pollData) => {
     const room = rooms.get(socket.roomId);
     if (room && pollData?.question && Array.isArray(pollData?.options)) {
@@ -262,7 +294,6 @@ io.on('connection', (socket) => {
       });
       const targetOpt = room.poll.options.find((o) => o.id === optionId);
       if (targetOpt) targetOpt.votes.push(socket.id);
-
       io.to(socket.roomId).emit('poll:updated', room.poll);
     }
   });
@@ -275,7 +306,134 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 6. MODERASYON
+  // 6. MİNİ OYUN YÖNETİMİ
+  socket.on('game:start', ({ gameType, lang, customConfig }) => {
+    const room = rooms.get(socket.roomId);
+    if (!room || socket.id !== room.host) return;
+
+    room.mediaState.playbackState = 'PAUSED';
+
+    if (gameType === 'DOODLE') {
+      const drawer = room.users[Math.floor(Math.random() * room.users.length)];
+      room.game = {
+        type: 'DOODLE',
+        lang: lang || 'tr',
+        drawerId: drawer.id,
+        drawerName: drawer.username,
+        word: customConfig?.word || 'Kedi',
+        wordList: customConfig?.wordList || ['Kedi', 'Gitar', 'Pizza'],
+        strokes: []
+      };
+      io.to(socket.roomId).emit('game:started', room.game);
+    } else if (gameType === 'SPYFALL') {
+      const spyIndex = Math.floor(Math.random() * room.users.length);
+      const spyUser = room.users[spyIndex];
+      const chosenLocation = customConfig?.location || 'Sinema';
+      const endTime = Date.now() + (5 * 60 * 1000);
+
+      room.game = {
+        type: 'SPYFALL',
+        phase: 'PLAYING',
+        lang: lang || 'tr',
+        spyId: spyUser.id,
+        spyName: spyUser.username,
+        location: chosenLocation,
+        endTime,
+        votes: {}
+      };
+
+      const userSummary = room.users.map((u) => ({ id: u.id, username: u.username, avatar: u.avatar }));
+
+      room.users.forEach((u) => {
+        const isSpy = u.id === spyUser.id;
+        io.to(u.id).emit('game:started', {
+          type: 'SPYFALL',
+          phase: 'PLAYING',
+          isSpy,
+          location: isSpy ? null : chosenLocation,
+          endTime,
+          users: userSummary
+        });
+      });
+    }
+  });
+
+  // Çizim Vuruşunu Odadakilere Dağıt
+  socket.on('game:draw_stroke', (stroke) => {
+    const room = rooms.get(socket.roomId);
+    if (room && room.game?.type === 'DOODLE') {
+      room.game.strokes = room.game.strokes || [];
+      room.game.strokes.push(stroke);
+      socket.to(socket.roomId).emit('game:draw_stroke', stroke);
+    }
+  });
+
+  socket.on('game:clear_canvas', () => {
+    const room = rooms.get(socket.roomId);
+    if (room && room.game?.type === 'DOODLE') {
+      room.game.strokes = [];
+      io.to(socket.roomId).emit('game:clear_canvas');
+    }
+  });
+
+  socket.on('game:end', () => {
+    const room = rooms.get(socket.roomId);
+    if (room && socket.id === room.host) {
+      room.game = null;
+      io.to(socket.roomId).emit('game:ended');
+    }
+  });
+
+  socket.on('game:spyfall_start_voting', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room || room.game?.type !== 'SPYFALL') return;
+
+    room.game.phase = 'VOTING';
+    room.game.endTime = Date.now() + (60 * 1000);
+    room.game.votes = {};
+
+    io.to(socket.roomId).emit('game:spyfall_phase_change', {
+      phase: 'VOTING',
+      endTime: room.game.endTime,
+      users: room.users.map((u) => ({ id: u.id, username: u.username, avatar: u.avatar }))
+    });
+  });
+
+  socket.on('game:spyfall_vote', ({ targetId }) => {
+    const room = rooms.get(socket.roomId);
+    if (!room || room.game?.type !== 'SPYFALL' || room.game.phase !== 'VOTING') return;
+
+    room.game.votes[socket.id] = targetId;
+
+    io.to(socket.roomId).emit('game:spyfall_vote_progress', {
+      votedCount: Object.keys(room.game.votes).length,
+      totalCount: room.users.length
+    });
+
+    if (Object.keys(room.game.votes).length >= room.users.length) {
+      resolveSpyfallVotes(room, socket.roomId);
+    }
+  });
+
+  socket.on('game:spyfall_time_up', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room || room.game?.type !== 'SPYFALL') return;
+
+    if (room.game.phase === 'PLAYING') {
+      room.game.phase = 'VOTING';
+      room.game.endTime = Date.now() + (60 * 1000);
+      room.game.votes = {};
+      io.to(socket.roomId).emit('game:spyfall_phase_change', {
+        phase: 'VOTING',
+        endTime: room.game.endTime,
+        users: room.users.map((u) => ({ id: u.id, username: u.username, avatar: u.avatar }))
+      });
+    } else if (room.game.phase === 'VOTING') {
+      resolveSpyfallVotes(room, socket.roomId);
+    }
+  });
+
+  // 7. MODERASYON
   socket.on('room:kick_user', ({ targetId }) => {
     const room = rooms.get(socket.roomId);
     if (room && socket.id === room.host && targetId !== socket.id) {
@@ -320,7 +478,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 7. MEDYA SENKRONİZASYONU
+  // 8. MEDYA & VİDEO YÖNETİMİ (Video açılınca oyunu otomatik kapatır)
   socket.on('media:sync_state', (payload) => {
     const room = rooms.get(socket.roomId);
     if (room && typeof payload === 'object') {
@@ -337,6 +495,12 @@ io.on('connection', (socket) => {
   socket.on('media:change_source', (payload) => {
     const room = rooms.get(socket.roomId);
     if (room && socket.id === room.host && payload?.type) {
+      // Video açıldığında odadaki aktif oyunu sonlandır
+      if (room.game) {
+        room.game = null;
+        io.to(socket.roomId).emit('game:ended');
+      }
+
       room.mediaState = {
         sourceType: sanitizeText(payload.type, 20),
         sourceUrl: typeof payload.url === 'string' ? payload.url.trim() : '',
@@ -350,7 +514,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 8. OYNATMA LİSTESİ
   socket.on('playlist:add', (item) => {
     const room = rooms.get(socket.roomId);
     if (room && item && room.playlist.length < 50) {
@@ -376,6 +539,10 @@ io.on('connection', (socket) => {
   socket.on('playlist:play_next', () => {
     const room = rooms.get(socket.roomId);
     if (room && socket.id === room.host && room.playlist.length > 0) {
+      if (room.game) {
+        room.game = null;
+        io.to(socket.roomId).emit('game:ended');
+      }
       const nextItem = room.playlist.shift();
       room.mediaState = {
         sourceType: nextItem.type,
@@ -390,10 +557,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 9. SOHBET & FLOOD KORUMASI
+  // 9. SOHBET & OYUN TAHMİN KONTROLÜ
   socket.on('chat:send', (messageData) => {
     chatRateCounter++;
-    if (chatRateCounter > 6) return; // Saniyede 6'dan fazla mesaj spam olarak reddedilir
+    if (chatRateCounter > 6) return;
 
     const room = rooms.get(socket.roomId);
     if (room) {
@@ -402,6 +569,7 @@ io.on('connection', (socket) => {
 
       const safeMessage = {
         id: sanitizeText(messageData.id, 40) || `${Date.now()}`,
+        senderId: socket.id,
         sender: sanitizeText(messageData.sender, 40),
         text: sanitizeText(messageData.text, 400),
         type: sanitizeText(messageData.type, 10) || 'TEXT',
@@ -409,6 +577,43 @@ io.on('connection', (socket) => {
         time: Date.now()
       };
       io.to(socket.roomId).emit('chat:message', safeMessage);
+
+      // Çiz & Bil Otomatik Doğrulama
+      if (room.game?.type === 'DOODLE' && socket.id !== room.game.drawerId && room.game.word) {
+        const guess = safeMessage.text.trim().toLowerCase();
+        const target = room.game.word.trim().toLowerCase();
+
+        if (guess === target) {
+          const isTr = room.game.lang === 'tr';
+          const winMsg = isTr
+            ? `🎉 ${sender.username} doğru tahmin etti! Kelime: "${room.game.word}"`
+            : `🎉 ${sender.username} guessed correctly! Word: "${room.game.word}"`;
+
+          io.to(socket.roomId).emit('chat:message', {
+            id: `${Date.now()}-win`,
+            senderId: 'system',
+            sender: '🤖 Peerora Bot',
+            text: winMsg,
+            type: 'TEXT',
+            color: '#10b981',
+            time: Date.now()
+          });
+
+          const users = room.users;
+          const currentDrawerIdx = users.findIndex((u) => u.id === room.game.drawerId);
+          const nextDrawer = users[(currentDrawerIdx + 1) % users.length];
+          const wordList = room.game.wordList || ['Kedi', 'Gitar', 'Pizza', 'Uçak'];
+          const nextWord = wordList[Math.floor(Math.random() * wordList.length)];
+
+          room.game.drawerId = nextDrawer.id;
+          room.game.drawerName = nextDrawer.username;
+          room.game.word = nextWord;
+          room.game.strokes = [];
+
+          io.to(socket.roomId).emit('game:started', room.game);
+          io.to(socket.roomId).emit('game:clear_canvas');
+        }
+      }
     }
   });
 
