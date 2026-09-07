@@ -252,7 +252,7 @@ io.on('connection', (socket) => {
     broadcastPublicRooms();
   });
 
-  // 3. WEBRTC
+  // 3. WEBRTC SİNYALLEŞMESİ
   socket.on('webrtc:signal', ({ targetId, payload }) => {
     if (targetId) {
       io.to(targetId).emit('webrtc:signal', { sender: socket.id, payload });
@@ -261,14 +261,14 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 4. LAZER
+  // 4. LAZER İMLEÇ
   socket.on('laser:point', (point) => {
     if (socket.roomId && point && typeof point.x === 'number' && typeof point.y === 'number') {
       socket.to(socket.roomId).emit('laser:point', { ...point, senderId: socket.id });
     }
   });
 
-  // 5. ANKET
+  // 5. ANKET SİSTEMİ
   socket.on('poll:create', (pollData) => {
     const room = rooms.get(socket.roomId);
     if (room && pollData?.question && Array.isArray(pollData?.options)) {
@@ -358,7 +358,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Çizim Vuruşunu Odadakilere Dağıt
   socket.on('game:draw_stroke', (stroke) => {
     const room = rooms.get(socket.roomId);
     if (room && room.game?.type === 'DOODLE') {
@@ -454,9 +453,18 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Liderlik Devri (Video açıkken devredilemez, oyun modunda serbest)
   socket.on('room:transfer_host', ({ newHostId }) => {
     const room = rooms.get(socket.roomId);
     if (room && socket.id === room.host) {
+      const hasActiveMedia = room.mediaState && room.mediaState.sourceType !== 'NONE';
+      const isGameActive = !!room.game;
+
+      // Ekranda aktif video varken devredilemez
+      if (hasActiveMedia && !isGameActive) {
+        return;
+      }
+
       const targetHost = room.users.find((u) => u.id === (newHostId || socket.id));
       if (targetHost) {
         let accurateTime = room.mediaState.currentTime;
@@ -478,7 +486,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 8. MEDYA & VİDEO YÖNETİMİ (Video açılınca oyunu otomatik kapatır)
+  // 8. MEDYA & VİDEO YÖNETİMİ
   socket.on('media:sync_state', (payload) => {
     const room = rooms.get(socket.roomId);
     if (room && typeof payload === 'object') {
@@ -495,21 +503,28 @@ io.on('connection', (socket) => {
   socket.on('media:change_source', (payload) => {
     const room = rooms.get(socket.roomId);
     if (room && socket.id === room.host && payload?.type) {
-      // Video açıldığında odadaki aktif oyunu sonlandır
       if (room.game) {
         room.game = null;
         io.to(socket.roomId).emit('game:ended');
       }
 
+      let resolvedType = sanitizeText(payload.type, 20);
+      const cleanUrl = typeof payload.url === 'string' ? payload.url.trim() : '';
+      if (cleanUrl && (resolvedType === 'DIRECT' || !resolvedType || resolvedType === 'NONE')) {
+        if (cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be')) {
+          resolvedType = 'YOUTUBE';
+        }
+      }
+
       room.mediaState = {
-        sourceType: sanitizeText(payload.type, 20),
-        sourceUrl: typeof payload.url === 'string' ? payload.url.trim() : '',
-        playbackState: 'PAUSED',
+        sourceType: resolvedType,
+        sourceUrl: cleanUrl,
+        playbackState: resolvedType !== 'NONE' ? 'PLAYING' : 'PAUSED',
         currentTime: 0,
         playbackRate: 1.0,
         lastUpdated: Date.now()
       };
-      io.to(socket.roomId).emit('media:change_source', payload);
+      io.to(socket.roomId).emit('media:change_source', { ...payload, type: resolvedType, url: cleanUrl });
       broadcastPublicRooms();
     }
   });
@@ -517,11 +532,17 @@ io.on('connection', (socket) => {
   socket.on('playlist:add', (item) => {
     const room = rooms.get(socket.roomId);
     if (room && item && room.playlist.length < 50) {
+      const cleanUrl = typeof item.url === 'string' ? item.url.trim() : '';
+      let cleanType = sanitizeText(item.type, 20) || 'DIRECT';
+      if (cleanUrl && (cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be'))) {
+        cleanType = 'YOUTUBE';
+      }
+
       const cleanItem = {
         id: sanitizeText(item.id, 40) || `${Date.now()}`,
         title: sanitizeText(item.title, 100) || 'Video',
-        url: typeof item.url === 'string' ? item.url.trim() : '',
-        type: sanitizeText(item.type, 20) || 'DIRECT'
+        url: cleanUrl,
+        type: cleanType
       };
       room.playlist.push(cleanItem);
       io.to(socket.roomId).emit('playlist:updated', room.playlist);
@@ -536,28 +557,50 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Sıradakini Başlat veya Medyayı Kapat
   socket.on('playlist:play_next', () => {
     const room = rooms.get(socket.roomId);
-    if (room && socket.id === room.host && room.playlist.length > 0) {
+    if (room && socket.id === room.host) {
       if (room.game) {
         room.game = null;
         io.to(socket.roomId).emit('game:ended');
       }
-      const nextItem = room.playlist.shift();
-      room.mediaState = {
-        sourceType: nextItem.type,
-        sourceUrl: nextItem.url,
-        playbackState: 'PLAYING',
-        currentTime: 0,
-        playbackRate: 1.0,
-        lastUpdated: Date.now()
-      };
-      io.to(socket.roomId).emit('playlist:updated', room.playlist);
-      io.to(socket.roomId).emit('media:change_source', { type: nextItem.type, url: nextItem.url });
+
+      if (room.playlist.length > 0) {
+        const nextItem = room.playlist.shift();
+        let itemType = nextItem.type;
+        if (!itemType || itemType === 'DIRECT') {
+          const isYt = nextItem.url && (nextItem.url.includes('youtube.com') || nextItem.url.includes('youtu.be'));
+          if (isYt) itemType = 'YOUTUBE';
+        }
+
+        room.mediaState = {
+          sourceType: itemType || 'DIRECT',
+          sourceUrl: nextItem.url,
+          playbackState: 'PLAYING',
+          currentTime: 0,
+          playbackRate: 1.0,
+          lastUpdated: Date.now()
+        };
+        io.to(socket.roomId).emit('playlist:updated', room.playlist);
+        io.to(socket.roomId).emit('media:change_source', { type: room.mediaState.sourceType, url: nextItem.url });
+      } else {
+        // Sırada video yoksa medyayı kapat
+        room.mediaState = {
+          sourceType: 'NONE',
+          sourceUrl: '',
+          playbackState: 'PAUSED',
+          currentTime: 0,
+          playbackRate: 1.0,
+          lastUpdated: Date.now()
+        };
+        io.to(socket.roomId).emit('media:change_source', { type: 'NONE', url: '' });
+      }
+      broadcastPublicRooms();
     }
   });
 
-  // 9. SOHBET & OYUN TAHMİN KONTROLÜ
+  // 9. SOHBET & OYUN TAHMİN KONTROLÜ (Muted kullanıcılar chate yazabilir)
   socket.on('chat:send', (messageData) => {
     chatRateCounter++;
     if (chatRateCounter > 6) return;
@@ -565,7 +608,7 @@ io.on('connection', (socket) => {
     const room = rooms.get(socket.roomId);
     if (room) {
       const sender = room.users.find((u) => u.id === socket.id);
-      if (sender && sender.isMuted) return;
+      if (!sender) return; // isMuted kontrolü kaldırıldı (chate yazabilir)
 
       const safeMessage = {
         id: sanitizeText(messageData.id, 40) || `${Date.now()}`,
