@@ -16,7 +16,8 @@ const allowedOrigins = [
   'capacitor://localhost',
   'https://www.theosdev.web.tr',
   'https://theosdev.web.tr',
-  'https://peerora.theosdev.web.tr'
+  'https://peerora.theosdev.web.tr',
+  'https://peerora-client.vercel.app'
 ];
 app.use(cors({
   origin: (origin, callback) => {
