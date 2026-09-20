@@ -356,6 +356,31 @@ io.on('connection', (socket) => {
         });
       });
     }
+    else if (gameType === 'WORDBOMB') {
+      const players = room.users.map((u) => ({ id: u.id, username: u.username, avatar: u.avatar }));
+      const firstIndex = Math.floor(Math.random() * players.length);
+      const trSyllables = ['BA', 'KA', 'TA', 'MA', 'DE', 'LE', 'AN', 'EL', 'AR', 'OR', 'KO', 'ME', 'SE', 'VER', 'YOL', 'AL', 'BİL', 'SES', 'CAN', 'GÖZ', 'KARA', 'DEN'];
+      const enSyllables = ['TH', 'IN', 'ST', 'RE', 'AN', 'ER', 'ON', 'AT', 'EN', 'ND', 'TI', 'ES', 'OR', 'TE', 'ED', 'IS', 'IT', 'AL', 'AR', 'TO', 'ME', 'OUT'];
+      const pool = (lang === 'tr') ? trSyllables : enSyllables;
+      const firstSyllable = pool[Math.floor(Math.random() * pool.length)];
+
+      room.game = {
+        type: 'WORDBOMB',
+        phase: 'PLAYING',
+        lang: lang || 'tr',
+        players,
+        currentTurnIndex: firstIndex,
+        currentTurnId: players[firstIndex].id,
+        currentTurnName: players[firstIndex].username,
+        currentTurnAvatar: players[firstIndex].avatar,
+        syllable: firstSyllable,
+        turnEndTime: Date.now() + 10000,
+        usedWords: [],
+        loser: null
+      };
+
+      io.to(socket.roomId).emit('game:started', room.game);
+    }
   });
 
   socket.on('game:draw_stroke', (stroke) => {
@@ -621,6 +646,50 @@ io.on('connection', (socket) => {
       };
       io.to(socket.roomId).emit('chat:message', safeMessage);
 
+      // 1.2: Kelime Bombası Chat Doğrulaması
+      if (room.game?.type === 'WORDBOMB' && room.game.phase === 'PLAYING') {
+        if (socket.id === room.game.currentTurnId) {
+          const rawWord = safeMessage.text.trim().toLocaleUpperCase(room.game.lang === 'tr' ? 'tr-TR' : 'en-US');
+          const targetSyllable = room.game.syllable.toLocaleUpperCase(room.game.lang === 'tr' ? 'tr-TR' : 'en-US');
+
+          // Kural: Heceyi içermeli, en az 3 harf olmalı ve o elde daha önce kullanılmamış olmalı
+          if (rawWord.length >= 3 && rawWord.includes(targetSyllable) && !room.game.usedWords.includes(rawWord)) {
+            room.game.usedWords.push(rawWord);
+
+            // Sıradaki oyuncuya devret
+            room.game.currentTurnIndex = (room.game.currentTurnIndex + 1) % room.game.players.length;
+            const nextPlayer = room.game.players[room.game.currentTurnIndex];
+            room.game.currentTurnId = nextPlayer.id;
+            room.game.currentTurnName = nextPlayer.username;
+            room.game.currentTurnAvatar = nextPlayer.avatar;
+
+            // Yeni hece seç ve 10 saniyeyi sıfırla
+            const trSyllables = ['BA', 'KA', 'TA', 'MA', 'DE', 'LE', 'AN', 'EL', 'AR', 'OR', 'KO', 'ME', 'SE', 'VER', 'YOL', 'AL', 'BİL', 'SES', 'CAN', 'GÖZ', 'KARA', 'DEN'];
+            const enSyllables = ['TH', 'IN', 'ST', 'RE', 'AN', 'ER', 'ON', 'AT', 'EN', 'ND', 'TI', 'ES', 'OR', 'TE', 'ED', 'IS', 'IT', 'AL', 'AR', 'TO', 'ME', 'OUT'];
+            const pool = (room.game.lang === 'tr') ? trSyllables : enSyllables;
+            room.game.syllable = pool[Math.floor(Math.random() * pool.length)];
+            room.game.turnEndTime = Date.now() + 10000;
+
+            // Chate bot bildirimi gönder
+            const isTr = room.game.lang === 'tr';
+            io.to(socket.roomId).emit('chat:message', {
+              id: `${Date.now()}-wb`,
+              senderId: 'system',
+              sender: '💣 Peerora Bot',
+              text: isTr 
+                ? `✅ ${sender.username} bildi ("${rawWord}")! Bomba ${nextPlayer.username}'e geçti!`
+                : `✅ ${sender.username} got it ("${rawWord}")! Bomb passed to ${nextPlayer.username}!`,
+              type: 'TEXT',
+              color: '#3b82f6',
+              time: Date.now()
+            });
+            
+            // Odaya yeni tur bilgisini ilet
+            io.to(socket.roomId).emit('game:wordbomb_turn', room.game);
+          }
+        }
+      }
+
       // Çiz & Bil Otomatik Doğrulama
       if (room.game?.type === 'DOODLE' && socket.id !== room.game.drawerId && room.game.word) {
         const guess = safeMessage.text.trim().toLowerCase();
@@ -677,6 +746,40 @@ io.on('connection', (socket) => {
         x: Number(reactionData.x) || 50
       });
     }
+  });
+
+  // 1.2: Ekrana Çağırma / Nudge Bildirimi (15 saniye cooldown ile)
+  socket.on('room:nudge', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room) return;
+
+    const sender = room.users.find((u) => u.id === socket.id);
+    const senderName = sender ? sender.username : 'Birisi';
+
+    // Odadaki diğer kullanıcılara çağrıyı ilet
+    socket.to(socket.roomId).emit('room:nudged', {
+      senderId: socket.id,
+      senderName
+    });
+  });
+
+  // 1.2: Kelime Bombası Patlama Olayı
+  socket.on('game:wordbomb_time_up', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room || room.game?.type !== 'WORDBOMB' || room.game.phase !== 'PLAYING') return;
+
+    room.game.phase = 'EXPLODED';
+    room.game.loser = {
+      id: room.game.currentTurnId,
+      username: room.game.currentTurnName,
+      avatar: room.game.currentTurnAvatar
+    };
+
+    io.to(socket.roomId).emit('game:wordbomb_exploded', {
+      loser: room.game.loser,
+      lastSyllable: room.game.syllable,
+      usedWordsCount: room.game.usedWords.length
+    });
   });
 
   socket.on('room:leave', () => handleLeave(socket));
